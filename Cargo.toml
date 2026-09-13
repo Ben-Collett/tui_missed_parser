@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 ratatui = "0.29"
 crossterm = "0.28"
+arboard = { version = "3", features = ["wayland-data-control"] }
 
 [profile.release]
 lto = true

@@ -1,3 +1,4 @@
+mod clipboard;
 mod merge;
 mod parse;
 
@@ -415,14 +416,7 @@ fn finish(pairs: &[(String, String)]) -> io::Result<()> {
     let path = PathBuf::from(format!("/tmp/missed_{stamp}.txt"));
     fs::write(&path, body)?;
     let joined = sorted.iter().map(|p| p.0.as_str()).collect::<Vec<_>>().join(" ");
-    let copied = Command::new("wl-copy")
-        .arg(&joined)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !copied {
-        eprintln!("warning: could not copy to clipboard (wl-copy failed)");
-    }
+    let _ = clipboard::copy_to_clipboard(&joined);
     ratatui::restore();
     let editor = std::env::var("VISUAL")
         .ok()
