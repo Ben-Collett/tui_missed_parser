@@ -1,6 +1,8 @@
 mod clipboard;
+mod config;
 mod merge;
 mod parse;
+mod platform;
 
 #[cfg(test)]
 #[path = "tests/main.rs"]
@@ -8,7 +10,6 @@ mod tests;
 
 use std::fs;
 use std::io;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -18,11 +19,16 @@ use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use ratatui::{Frame, DefaultTerminal};
+use ratatui::{DefaultTerminal, Frame};
 
 use merge::merge_all;
-use parse::{parse_line, Entry};
+use parse::{Entry, Parser};
 
+/// Default subdirectory under the user's home directory.
+///
+/// On Unix the resolved default dir is `$HOME/Documents/logs`.
+/// On Windows the resolved default dir is `%USERPROFILE%\Documents\logs`
+/// (or `%HOME%\Documents\logs` if `$HOME` is set, e.g. by Git for Windows).
 const DEFAULT_DIR: &str = "Documents/logs";
 const CURSOR_BG: Color = Color::Indexed(238);
 const CURRENT_TRIGGER: Color = Color::LightMagenta;
@@ -30,7 +36,14 @@ const ALT_TRIGGER: Color = Color::DarkGray;
 
 fn main() {
     let dir = parse_args();
-    let files = match discover(&dir) {
+    let parser = match load_parser() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    };
+    let files = match discover(&dir, &parser) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("failed to read {}: {e}", dir.display());
@@ -39,6 +52,7 @@ fn main() {
     };
     let app = App {
         dir,
+        parser,
         screen: Screen::Files(FilesScreen::new(files)),
     };
     if let Err(e) = run(app) {
@@ -47,34 +61,29 @@ fn main() {
     }
 }
 
+fn load_parser() -> Result<Parser, String> {
+    let message = config::load_message()?;
+    Parser::from_template(&message)
+}
+
 fn parse_args() -> PathBuf {
     let mut dir: Option<PathBuf> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         if a == "--dir" || a == "-d" {
             if let Some(v) = args.next() {
-                dir = Some(expand_home(&v));
+                dir = Some(platform::expand_home(&v));
             }
         } else if let Some(v) = a.strip_prefix("--dir=") {
-            dir = Some(expand_home(v));
+            dir = Some(platform::expand_home(v));
         }
     }
     dir.unwrap_or_else(|| {
-        let home = std::env::var("HOME").unwrap_or_default();
-        PathBuf::from(home).join(DEFAULT_DIR)
+        match platform::home_dir() {
+            Some(home) => home.join(DEFAULT_DIR),
+            None => PathBuf::from(DEFAULT_DIR),
+        }
     })
-}
-
-fn expand_home(p: &str) -> PathBuf {
-    if let Ok(home) = std::env::var("HOME") {
-        if p == "~" {
-            return PathBuf::from(home);
-        }
-        if let Some(rest) = p.strip_prefix("~/") {
-            return PathBuf::from(home).join(rest);
-        }
-    }
-    PathBuf::from(p)
 }
 
 struct FileInfo {
@@ -84,7 +93,7 @@ struct FileInfo {
     skipped: usize,
 }
 
-fn discover(dir: &Path) -> io::Result<Vec<FileInfo>> {
+fn discover(dir: &Path, parser: &Parser) -> io::Result<Vec<FileInfo>> {
     let mut files = Vec::new();
     if dir.is_dir() {
         for entry in fs::read_dir(dir)? {
@@ -93,7 +102,7 @@ fn discover(dir: &Path) -> io::Result<Vec<FileInfo>> {
             if path.extension().and_then(|e| e.to_str()) != Some("log") || !path.is_file() {
                 continue;
             }
-            let (entries, skipped) = parse_log_file(&path);
+            let (entries, skipped) = parse_log_file(&path, parser);
             files.push(FileInfo {
                 name: entry.file_name().to_string_lossy().into_owned(),
                 path,
@@ -106,14 +115,14 @@ fn discover(dir: &Path) -> io::Result<Vec<FileInfo>> {
     Ok(files)
 }
 
-fn parse_log_file(path: &Path) -> (usize, usize) {
+fn parse_log_file(path: &Path, parser: &Parser) -> (usize, usize) {
     let Ok(text) = fs::read_to_string(path) else {
         return (0, 0);
     };
     let mut entries = 0;
     let mut skipped = 0;
     for line in text.lines() {
-        if parse_line(line).is_some() {
+        if parser.parse_line(line).is_some() {
             entries += 1;
         } else {
             skipped += 1;
@@ -122,11 +131,11 @@ fn parse_log_file(path: &Path) -> (usize, usize) {
     (entries, skipped)
 }
 
-fn read_entries(path: &Path) -> Vec<Entry> {
+fn read_entries(path: &Path, parser: &Parser) -> Vec<Entry> {
     let Ok(text) = fs::read_to_string(path) else {
         return Vec::new();
     };
-    text.lines().filter_map(parse_line).collect()
+    text.lines().filter_map(|l| parser.parse_line(l)).collect()
 }
 
 struct FilesScreen {
@@ -189,6 +198,7 @@ enum Screen {
 
 struct App {
     dir: PathBuf,
+    parser: Parser,
     screen: Screen,
 }
 
@@ -232,11 +242,13 @@ fn event_loop(term: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
                 }
             }
             Nav::Advance => {
-                let has_selection = matches!(&app.screen, Screen::Files(fs) if fs.selected.iter().any(|&s| s));
+                let has_selection =
+                    matches!(&app.screen, Screen::Files(fs) if fs.selected.iter().any(|&s| s));
                 if !has_selection {
                     match &mut app.screen {
                         Screen::Files(fs) => {
-                            fs.status = Some("no files selected - press space to mark files".to_string())
+                            fs.status =
+                                Some("no files selected - press space to mark files".to_string())
                         }
                         Screen::Words(_) => {}
                     }
@@ -248,7 +260,7 @@ fn event_loop(term: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
                         let mut entries = Vec::new();
                         for (info, &sel) in fs.files.iter().zip(&fs.selected) {
                             if sel {
-                                entries.extend(read_entries(&info.path));
+                                entries.extend(read_entries(&info.path, &app.parser));
                             }
                         }
                         entries
@@ -270,6 +282,7 @@ fn event_loop(term: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
                     Screen::Files(_) => unreachable!(),
                 };
                 finish(&pairs)?;
+                return Ok(());
             }
         }
     }
@@ -390,7 +403,11 @@ fn format_buffer(pairs: &[(String, String)]) -> String {
             .cmp(&b.0.to_lowercase())
             .then_with(|| a.0.cmp(&b.0))
     });
-    let width = sorted.iter().map(|p| p.0.chars().count()).max().unwrap_or(0);
+    let width = sorted
+        .iter()
+        .map(|p| p.0.chars().count())
+        .max()
+        .unwrap_or(0);
     let mut body = String::new();
     for (out, trig) in &sorted {
         body.push_str(&format!("{out:<width$} {trig}\n"));
@@ -411,23 +428,57 @@ fn finish(pairs: &[(String, String)]) -> io::Result<()> {
     let body = format!("{}\n", format_buffer(pairs));
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let path = PathBuf::from(format!("/tmp/missed_{stamp}.txt"));
+        .unwrap_or_default();
+    let path = std::env::temp_dir().join(format!(
+        "missed_{}_{}.txt",
+        stamp.as_secs(),
+        stamp.subsec_nanos()
+    ));
     fs::write(&path, body)?;
-    let joined = sorted.iter().map(|p| p.0.as_str()).collect::<Vec<_>>().join(" ");
+    let joined = sorted
+        .iter()
+        .map(|p| p.0.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
     let _ = clipboard::copy_to_clipboard(&joined);
     ratatui::restore();
-    let editor = std::env::var("VISUAL")
-        .ok()
-        .or_else(|| std::env::var("EDITOR").ok())
-        .unwrap_or_else(|| String::from("nvim"));
-    Err(Command::new("sh")
+    launch_editor(&path)
+}
+
+#[cfg(not(windows))]
+fn launch_editor(path: &Path) -> io::Result<()> {
+    let editor = resolve_editor("nvim");
+    let status = Command::new("sh")
         .arg("-c")
         .arg(format!("exec {editor} \"$1\""))
         .arg("sh")
         .arg(path)
-        .exec())
+        .status()?;
+    check_editor_status(&editor, status)
+}
+
+#[cfg(windows)]
+fn launch_editor(path: &Path) -> io::Result<()> {
+    let editor = resolve_editor("notepad");
+    let status = Command::new(&editor).arg(path).status()?;
+    check_editor_status(&editor, status)
+}
+
+fn resolve_editor(fallback: &str) -> String {
+    std::env::var("VISUAL")
+        .ok()
+        .or_else(|| std::env::var("EDITOR").ok())
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+fn check_editor_status(editor: &str, status: std::process::ExitStatus) -> io::Result<()> {
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "editor {editor:?} exited with {status}"
+        )))
+    }
 }
 
 fn render(f: &mut Frame<'_>, app: &mut App) {
@@ -467,9 +518,14 @@ fn render(f: &mut Frame<'_>, app: &mut App) {
     );
 }
 
-fn render_files(fs: &mut FilesScreen, area: Rect, dir: &Path) -> (String, Vec<Line<'static>>, String) {
+fn render_files(
+    fs: &mut FilesScreen,
+    area: Rect,
+    dir: &Path,
+) -> (String, Vec<Line<'static>>, String) {
     let title = format!("select log files - {}", dir.display());
-    let help = "space select | j/k or up/down move | g bottom | G top | enter parse | q/esc quit".to_string();
+    let help = "space select | j/k or up/down move | g bottom | G top | enter parse | q/esc quit"
+        .to_string();
     let visible = area.height.saturating_sub(2) as usize;
     fs.offset = clamp_offset(fs.offset, fs.cursor, visible, fs.files.len());
 
@@ -529,7 +585,12 @@ fn render_words(ws: &mut WordsScreen, area: Rect) -> (String, Vec<Line<'static>>
         ));
         return (title, lines, help);
     }
-    let max_out = ws.words.iter().map(|w| w.output.chars().count()).max().unwrap_or(0);
+    let max_out = ws
+        .words
+        .iter()
+        .map(|w| w.output.chars().count())
+        .max()
+        .unwrap_or(0);
     for i in ws.offset..ws.words.len().min(ws.offset + visible) {
         let w = &ws.words[i];
         let mut spans = vec![
