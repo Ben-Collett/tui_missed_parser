@@ -1,12 +1,12 @@
 [package]
-name = "mp"
+name = "mtui"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-ratatui = "0.29"
-crossterm = "0.28"
 arboard = "3"
+crossterm = "0.28"
+ratatui = "0.29"
 regex = "1"
 toml = "0.9"
 
@@ -14,5 +14,5 @@ toml = "0.9"
 arboard = { version = "3", features = ["wayland-data-control"] }
 
 [profile.release]
-lto = true
 strip = true
+lto = true
