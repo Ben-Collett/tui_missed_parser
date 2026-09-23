@@ -1,5 +1,6 @@
 mod clipboard;
 mod config;
+mod json;
 mod merge;
 mod parse;
 mod platform;
@@ -91,6 +92,7 @@ struct FileInfo {
     path: PathBuf,
     entries: usize,
     skipped: usize,
+    invalid: bool,
 }
 
 fn discover(dir: &Path, parser: &Parser) -> io::Result<Vec<FileInfo>> {
@@ -99,15 +101,23 @@ fn discover(dir: &Path, parser: &Parser) -> io::Result<Vec<FileInfo>> {
         for entry in fs::read_dir(dir)? {
             let Ok(entry) = entry else { continue };
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("log") || !path.is_file() {
+            let ext = path.extension().and_then(|e| e.to_str());
+            if !matches!(ext, Some("log") | Some("json")) || !path.is_file() {
                 continue;
             }
-            let (entries, skipped) = parse_log_file(&path, parser);
+            let (entries, skipped, invalid) = match ext {
+                Some("json") => parse_json_file(&path),
+                _ => {
+                    let (entries, skipped) = parse_log_file(&path, parser);
+                    (entries, skipped, false)
+                }
+            };
             files.push(FileInfo {
                 name: entry.file_name().to_string_lossy().into_owned(),
                 path,
                 entries,
                 skipped,
+                invalid,
             });
         }
     }
@@ -131,7 +141,26 @@ fn parse_log_file(path: &Path, parser: &Parser) -> (usize, usize) {
     (entries, skipped)
 }
 
+fn parse_json_file(path: &Path) -> (usize, usize, bool) {
+    let Ok(text) = fs::read_to_string(path) else {
+        return (0, 0, true);
+    };
+    match json::parse_json(&text) {
+        Ok((entries, skipped)) => (entries.len(), skipped, false),
+        Err(_) => (0, 0, true),
+    }
+}
+
 fn read_entries(path: &Path, parser: &Parser) -> Vec<Entry> {
+    let ext = path.extension().and_then(|e| e.to_str());
+    if ext == Some("json") {
+        let Ok(text) = fs::read_to_string(path) else {
+            return Vec::new();
+        };
+        return json::parse_json(&text)
+            .map(|(entries, _)| entries)
+            .unwrap_or_default();
+    }
     let Ok(text) = fs::read_to_string(path) else {
         return Vec::new();
     };
@@ -149,7 +178,7 @@ struct FilesScreen {
 impl FilesScreen {
     fn new(files: Vec<FileInfo>) -> Self {
         let status = if files.is_empty() {
-            Some("no .log files found".to_string())
+            Some("no .log or .json files found".to_string())
         } else {
             None
         };
@@ -523,7 +552,7 @@ fn render_files(
     area: Rect,
     dir: &Path,
 ) -> (String, Vec<Line<'static>>, String) {
-    let title = format!("select log files - {}", dir.display());
+    let title = format!("select log/json files - {}", dir.display());
     let help = "space select | j/k or up/down move | g bottom | G top | enter parse | q/esc quit"
         .to_string();
     let visible = area.height.saturating_sub(2) as usize;
@@ -532,7 +561,7 @@ fn render_files(
     let mut lines = Vec::new();
     if fs.files.is_empty() {
         lines.push(Line::styled(
-            "no .log files found",
+            "no .log or .json files found",
             Style::new().fg(Color::Yellow),
         ));
         return (title, lines, help);
@@ -556,6 +585,12 @@ fn render_files(
                 Style::new().fg(Color::DarkGray),
             ),
         ];
+        if info.invalid {
+            spans.push(Span::styled(
+                " (invalid json)".to_string(),
+                Style::new().fg(Color::Yellow),
+            ));
+        }
         if info.skipped > 0 {
             spans.push(Span::styled(
                 format!(" ({} skipped)", info.skipped),
